@@ -1,0 +1,22 @@
+[project]
+name = "distributed-event-deduplication"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.128.0",
+    "pydantic-settings>=2.12.0",
+    "structlog>=25.5.0",
+    "uvicorn[standard]>=0.40.0",
+]
+authors = [
+    { name = "Your Name", email = "muhammedfayiz122@gmail.com" },
+]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+where = "app"
