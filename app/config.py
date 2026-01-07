@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     version: str = "0.1.0"
     debug: bool = True
     
+    dedup_ttl_seconds: int = 300  # Time-to-live for deduplication keys in seconds
+    
 @lru_cache()
 def get_settings() -> Settings:
     """Get cached settings instance."""
