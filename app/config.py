@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     version: str = "0.1.0"
     debug: bool = True
     
+    log_format: str = Field(default="json")  # Options: "json" or "console"
+    
     instance_id: str = str(uuid4())
     dedup_ttl_seconds: int = 300  # Time-to-live for deduplication keys in seconds
     

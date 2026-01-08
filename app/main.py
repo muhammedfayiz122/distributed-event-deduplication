@@ -10,6 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.events_table import Events 
 from uuid import uuid4
 import json
+from app.utils.logger import setup_logging
+
+setup_logging()
 
 logger = get_logger(__name__)
 INSTANCE_ID = settings.instance_id
@@ -76,51 +79,66 @@ async def process_persist(event: Events, db: AsyncSession):
         raise
 
 @app.websocket("/events")
-async def websocket_endpoint(websocket: WebSocket, db: AsyncSession =  Depends(get_db_session)):
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected to /events", instance_id=INSTANCE_ID)
     
-    try:
-        while True:
-            raw_data = await websocket.receive_text()
-            try:
-                event =  EventSchema(**json.loads(raw_data))
-            except ValidationError as ve:
-                error_msg = f"Invalid event format received: {ve.errors()}"
-                logger.error(error_msg)
-                # await websocket.send_text(error_msg)
-                continue
-            
-            if not event.event_id:
-                logger.warning("Received event without event_id")
-                continue
-            
-            claimed = False
-            dedup_key = f"dedup:{event.event_id}"
-            try:
-                claimed = await redis_client.set( # Redis SET NX is very fast (~100k ops/sec easily)
-                dedup_key, INSTANCE_ID, nx=True, ex=settings.dedup_ttl_seconds
-            )
-            except Exception as redis_error:
-                logger.error(f"Redis error during deduplication check: {redis_error}")
-                # await websocket.send_text(f"Redis error: {redis_error}")
-                continue
-            if not claimed:
-                logger.info("Duplicate event detected, skipping processing", event_id=event.event_id, event_type=event.event_type)
-                continue
+    async for db in get_db_session():
+        try:
+            while True:
+                raw_data = await websocket.receive_text()
+                try:
+                    event =  EventSchema(**json.loads(raw_data))
+                except ValidationError as ve:
+                    error_msg = f"Invalid event format received: {ve.errors()}"
+                    logger.error(error_msg)
+                    # await websocket.send_text(error_msg)
+                    continue
+                except json.JSONDecodeError as je:
+                    error_msg = f"JSON decode error: {str(je)}"
+                    logger.error(error_msg)
+                    # await websocket.send_text(error_msg)
+                    continue
+                except Exception as e:
+                    logger.error(f"Error parsing event: {e}")
+                    # await websocket.send_text(f"Error parsing event: {e}")
+                    continue
                 
-            # processing continues here for new events   
-            try:
-                await process_persist(event, db)
-            except Exception as db_error:
-                logger.error(f"Database error during event persistence: {db_error}")
-                await _release_lock_if_owner(dedup_key)
-                logger.exception("Processing failed", event_id=event.event_id, exc_info=db_error)
-                continue
-                #TODO: retry logic
-    except WebSocketDisconnect:
-        logger.info("Client disconnected from /events", instance_id=INSTANCE_ID)
-    except Exception as e:
-        exception_msg = f"An error occurred: {str(e)}"
-        logger.exception(exception_msg)
-        # await websocket.send_text(exception_msg)
+                if not event.event_id:
+                    logger.warning("Received event without event_id")
+                    continue
+                
+                claimed = False
+                dedup_key = f"dedup:{event.event_id}"
+                try:
+                    claimed = await redis_client.set( # Redis SET NX is very fast (~100k ops/sec easily)
+                    dedup_key, INSTANCE_ID, nx=True, ex=settings.dedup_ttl_seconds
+                )
+                except Exception as redis_error:
+                    logger.error(f"Redis error during deduplication check: {redis_error}")
+                    # await websocket.send_text(f"Redis error: {redis_error}")
+                    continue
+                if not claimed:
+                    logger.info("Duplicate event detected, skipping processing", event_id=event.event_id, event_type=event.event_type)
+                    continue
+                    
+                # processing continues here for new events   
+                try:
+                    if event.payload.get("force_fail"):
+                        logger.error("Forced failure triggered for testing", event_id=event.event_id)
+                        raise Exception("Forced failure for testing")
+                    await process_persist(event, db)
+                except Exception as db_error:
+                    logger.error(f"Database error during event persistence: {db_error}")
+                    await _release_lock_if_owner(dedup_key)
+                    logger.exception("Processing failed", event_id=event.event_id, exc_info=db_error)
+                    continue
+                    #TODO: retry logic
+        except WebSocketDisconnect:
+            logger.info("Client disconnected from /events", instance_id=INSTANCE_ID)
+        except Exception as e:
+            exception_msg = f"An error occurred: {str(e)}"
+            logger.exception(exception_msg)
+            # await websocket.send_text(exception_msg)
+        finally:
+            break
