@@ -1,47 +1,45 @@
 # Distributed Event Deduplication for WebSocket Listeners
 
-## Overview
-
-This project implements a **reliable distributed deduplication mechanism** for WebSocket event listeners. In environments where multiple listener instances receive duplicate events, the system guarantees that **each event is processed and persisted exactly once (logically once)** using a shared coordination store.
-
-The solution is designed to:
-
-* Tolerate **partial failures** (crashes, restarts, retries)
-* Prevent **double processing and side effects**
-* Scale horizontally with **high throughput and many listeners**
+>
+> This repository contains implementation of a **distributed event deduplication mechanism** for WebSocket listeners. The system guarantees that even if multiple listener instances receive the same event concurrently, **each event is processed and persisted exactly once (logically once)**.
 
 ---
 
-## Problem Statement
+## 1. Problem Context
 
-Multiple FastAPI instances are connected to the same WebSocket source. The same event may be delivered to multiple instances concurrently. We must ensure:
+In a distributed environment, multiple FastAPI instances are connected to the same WebSocket source. Due to fan-out delivery, network retries, or upstream behavior, **the same event can be delivered to multiple instances at the same time**.
 
-1. Only **one instance** processes and persists each event
-2. The system is **safe under crashes and retries**
-3. The architecture scales without race conditions
+The challenge is to design a system where:
+
+* More than one listener may receive the same event
+* **Only one instance must process and persist it**
+* The system must tolerate **crashes, retries, and partial failures**
+* The solution must scale to **high throughput and many listeners**
+
+This implementation directly addresses all of these requirements.
 
 ---
 
-## Architecture
+## 2. Architecture
 
 <img src="deduplication_arch.png" alt="Deduplication Architecture" width="800">
 
-### Component Roles
+### Components
 
-| Component             | Responsibility                           |
-| --------------------- | ---------------------------------------- |
-| **WebSocket**         | Event transport (fan-out delivery)       |
-| **FastAPI instances** | Receive events and attempt to process    |
-| **Redis**             | Atomic ownership claim (deduplication)   |
-| **Database**          | Final persistence with unique constraint |
+| Component             | Role                                        |
+| --------------------- | ------------------------------------------- |
+| **WebSocket Source**  | Sends events (may send duplicates)          |
+| **FastAPI Instances** | Receive events and attempt processing       |
+| **Redis**             | Global coordination store for deduplication |
+| **PostgreSQL**        | Final persistence with uniqueness guarantee |
 
-> **Important:** Redis is used only for coordination (deduplication), not for event transport or broadcasting.
+> **Important:** Redis is used only for **coordination and ownership claiming**. It is *not* used as a message broker or event store.
 
 ---
 
-## Design Principles
+## 3. Core Design Principles
 
-### 1. Atomic Ownership Claim
+### 3.1 Atomic Ownership Claim
 
 We use Redis `SET NX` to atomically claim an event:
 
@@ -49,57 +47,63 @@ We use Redis `SET NX` to atomically claim an event:
 SET dedup:{event_id} <instance_id> NX EX <ttl>
 ```
 
-* `NX` → only set if not exists (atomic)
+* `NX` → ensures the key is set only if it does not already exist (atomic)
 * `EX` → TTL for crash recovery
 
-Only one instance can claim a given `event_id`.
+This guarantees that **only one instance can own a given event at any time**.
 
 ---
 
-### 2. Instance Identity
+### 3.2 Instance Identity
 
-Each process generates a unique `instance_id` at startup (e.g., UUID). This ensures:
+Each FastAPI process generates a unique `instance_id` at startup. This is stored as the value of the Redis key.
 
-* Correct ownership tracking
-* Safe lock release (only the owner can release)
+This enables:
 
----
-
-### 3. Crash Recovery with TTL
-
-Locks are created with TTL so that if a process crashes:
-
-* The lock is automatically released
-* The event can be retried safely
-
-TTL is set **higher than the maximum expected processing time** to avoid premature expiry.
+* Safe ownership tracking
+* Preventing other instances from deleting a lock they do not own
 
 ---
 
-### 4. Idempotency for Side Effects
+### 3.3 Crash Recovery with TTL
 
-All side effects (DB writes, API calls, payments, emails) are designed to be **idempotent** using `event_id` as the idempotency key.
+If a process crashes after claiming an event (process craches , not error during processing):
 
-This guarantees safety under retries and partial execution.
+* It cannot release the lock
+* Redis TTL ensures the key is automatically removed
+* The event becomes eligible for retry
 
----
-
-## Consistency Guarantees
-
-* **Delivery:** At-least-once (WebSocket may deliver duplicates)
-* **Processing:** Exactly-once semantics (logical)
-* **Persistence:** Exactly-once enforced via Redis dedup + DB unique constraint
+TTL is configured **higher than the maximum expected processing time** to avoid premature expiry during normal execution.
 
 ---
 
-## Algorithm / Flow
+### 3.4 Idempotency of Side Effects
+
+ll side effects (DB writes, external API calls, payments, emails, etc.) are designed to be idempotent using a deterministic idempotency key derived from the event (typically event_id if it is globally unique and immutable; otherwise a dedicated idempotency_key field or a hash of stable event attributes).
+
+This ensures that even if processing is retried due to failure, **real-world side effects do not happen twice**.
+
+---
+
+## 4. Consistency Guarantees
+
+| Layer            | Guarantee                                     |
+| ---------------- | --------------------------------------------- |
+| **Delivery**     | At-least-once (WebSocket may send duplicates) |
+| **Processing**   | Exactly-once (logical) via Redis dedup        |
+| **Persistence**  | Exactly-once via DB unique constraint         |
+| **Side Effects** | Exactly-once via idempotency                  |
+
+---
+
+## 5. Algorithm & Flow
 
 ### High-Level Flow
 
 1. Receive event from WebSocket
 2. Extract `event_id`
 3. Attempt atomic claim in Redis
-4. If claim fails → ignore event
+4. If claim fails → **drop event**
 5. If claim succeeds → process event
 6. Persist event to DB
 7. On failure → release lock (only if owner)
@@ -110,135 +114,150 @@ This guarantees safety under retries and partial execution.
 
 ```
 onEvent(event):
-    eventId = event.id
+    eventId = event.event_id
+    dedup_key = "dedup:" + eventId
 
-    claimed = redis.SET("dedup:" + eventId, instanceId, NX, EX=TTL)
+    claimed = redis.SET(dedup_key, instanceId, NX, EX=TTL)
 
-    if not claimed:
+    if not claimed: # means another instance claimed it
         return  # duplicate, ignore
 
     try:
         process(event)        # idempotent operations
-        persist(event)        # DB insert with unique constraint
+        persist(event)        # DB insert (unique constraint)
     except:
-        if redis.GET("dedup:" + eventId) == instanceId:
-            redis.DEL("dedup:" + eventId)
+        if redis.GET(dedup_key) == instanceId:      # only owner can release
+            redis.DEL(dedup_key)        # now another instance can retry               
         raise
 ```
 
 ---
 
-## Failure Modes & Recovery
+## 6. Failure Modes & Recovery
 
-### 1. Instance crashes after claiming
+### 6.1 Instance Crashes After Claim
 
-* Redis TTL expires
+* Redis key remains
+* TTL expires
 * Event becomes available for retry
 
-### 2. Instance crashes during processing
+### 6.2 Instance Crashes During Processing
 
 * Partial execution assumed
-* TTL ensures delayed recovery
+* Immediate reprocessing is avoided
+* TTL ensures delayed, safe recovery
 * Idempotency prevents duplicate side effects
 
-### 3. Competing instances
+### 6.3 Competing Instances
 
 * Redis `SET NX` guarantees only one winner
 
-### 4. Redis restart
+### 6.4 Redis Restart
 
-* Keys lost → events may reprocess
+* Keys lost
+* Events may reprocess
 * DB unique constraint prevents duplicate persistence
 
 ---
 
-## Scaling Strategy
+## 7. Database Design
+
+Single minimal table:
+
+```
+events (
+    id BIGSERIAL PRIMARY KEY,
+    event_id VARCHAR UNIQUE NOT NULL,
+    event_type VARCHAR NOT NULL,
+    payload JSONB NOT NULL,
+    processed_at TIMESTAMP DEFAULT NOW()
+)
+```
+
+Why minimal?
+
+* Redis handles in-progress state
+* DB stores only final successful events
+* No status columns, no retry tables, no over-engineering
+
+---
+
+## 8. Scaling Strategy
 
 ### Horizontal Scaling
 
 * FastAPI instances are stateless
-* Add more instances to increase throughput
+* Add more instances freely
 
 ### Redis Scaling
 
-* Redis operations are O(1)
-* Can be clustered for high throughput
+* O(1) operations
+* Can be clustered or sharded
 
-### Bottlenecks & Mitigation
+### Database Scaling
 
-| Bottleneck           | Mitigation                                  |
-| -------------------- | ------------------------------------------- |
-| Redis                | Use Redis Cluster / sharding                |
-| Database             | Batch inserts, indexing, connection pooling |
-| WebSocket throughput | Load balancer, multiple connections         |
+* Index on `event_id`
+* Connection pooling
+* Read replicas if needed
 
 ---
 
-## Testing Strategy
+## 9. Testing Strategy (Implemented)
 
-### 1. Concurrency Simulation
+This project includes **real concurrency and distributed tests**.
 
-* Run multiple FastAPI instances
-* Send same event concurrently
-* Verify only one DB record is created
+### 9.1 Concurrent Delivery Test
 
-### 2. Crash Simulation
+* Multiple WebSocket clients send same event concurrently
+* Verified only one DB row is created
 
-* Kill instance after claiming lock
-* Verify TTL expiry allows retry
+### 9.2 Crash Simulation Test
 
-### 3. Duplicate Injection
+* Force failure after Redis claim
+* Verify lock release
+* Retry succeeds
+* DB contains only one row
 
-* Send same event multiple times
-* Validate idempotency
+### 9.3 Multi-Instance Test
 
-### 4. Load Testing
+* 5 FastAPI instances on different ports
+* Same Redis and DB
+* Same event sent to all
+* Verified exactly one DB row
 
-* High-frequency events
-* Observe Redis + DB behavior
-
----
-
-## Guarantees Summary
-
-| Aspect           | Guarantee                    |
-| ---------------- | ---------------------------- |
-| Event Processing | Exactly-once (logical)       |
-| Persistence      | Exactly-once (DB constraint) |
-| Side Effects     | Idempotent                   |
-| Crash Recovery   | TTL-based                    |
-| Race Conditions  | Prevented via atomic claim   |
+These tests prove correctness under real distributed conditions.
 
 ---
 
-## Why This Design Works
+## 10. Why This Design Works
 
-* **Redis SET NX** provides atomicity
-* **TTL** ensures recovery from crashes
-* **Instance ID** ensures safe ownership
+* **Redis SET NX** ensures atomic claim
+* **Instance ID** prevents unsafe lock deletion
+* **TTL** ensures crash recovery
 * **DB unique constraint** is final safety net
 * **Idempotency** prevents real-world damage
 
-This combination ensures correctness under concurrency, failures, and retries.
+This combination provides **strong correctness guarantees without over-engineering**.
 
 ---
 
-## Final Note
-
-This solution is intentionally simple, robust, and production-oriented. It avoids over-engineering while handling the hardest real-world failure cases in distributed systems.
-
----
-
-## How to Run
+## 11. How to Run
 
 1. Start Redis
-2. Run multiple FastAPI instances
-3. Connect WebSocket source
-4. Send events with unique `event_id`
-5. Observe deduplication in action
+2. Start PostgreSQL
+3. Run one or more FastAPI instances
+
+```
+uvicorn app.main:app --port 8000
+uvicorn app.main:app --port 8001
+...
+```
+
+4. Connect WebSocket producer to `/events`
+5. Send JSON events with unique `event_id`
 
 ---
 
-## Author
+## 12. Author
 
 Muhammed Fayiz
