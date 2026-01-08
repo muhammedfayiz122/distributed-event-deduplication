@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     
     dedup_ttl_seconds: int = 300  # Time-to-live for deduplication keys in seconds
     
+    # Database settings
+    database_url: str = "postgresql+asyncpg://postgres:123@localhost:5432/shipment_tracker_02"
+    
 @lru_cache()
 def get_settings() -> Settings:
     """Get cached settings instance."""

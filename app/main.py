@@ -1,14 +1,14 @@
 from fastapi import FastAPI, WebSocket
 from pydantic import ValidationError
 from app.config import settings
-from app.utils.logger import CustomLogger
+from app.utils.logger import get_logger
 from app.schemas.event_schema import EventSchema
 from app.utils.redis_client import redis_client
 # from app.utils.redis_client import get_redis_client
 from uuid import uuid4
 import json
 
-logger = CustomLogger().get_logger(__name__)
+logger = get_logger(__name__)
 
 INSTANCE_ID = str(uuid4())
 
