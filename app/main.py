@@ -4,7 +4,7 @@ from app.config import settings
 from app.utils.logger import get_logger
 from app.schemas.event_schema import EventSchema
 from app.utils.redis_client import redis_client
-# from app.utils.redis_client import get_redis_client
+from app.database.sessions import get_db_session
 from uuid import uuid4
 import json
 
@@ -23,19 +23,37 @@ app = FastAPI(
 @app.websocket("/events")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    logger.info("Client connected to /events (INSTANCE_ID=%s)", INSTANCE_ID)
     
-    while True:
-        try:
-            claimed = False
+    try:
+        while True:
             raw_data = await websocket.receive_text()
-            event =  EventSchema(**json.loads(raw_data))
+            try:
+                event =  EventSchema(**json.loads(raw_data))
+            except ValidationError as ve:
+                error_msg = f"Invalid event format received: {ve.errors()}"
+                logger.error(error_msg)
+                await websocket.send_text(error_msg)
+                continue
+            
             if not event.event_id:
                 logger.warning("Received event without event_id")
                 continue
             
-            is_new = await redis_client.set( # Redis SET NX is very fast (~100k ops/sec easily)
+            claimed = False
+            try:
+                claimed = await redis_client.set( # Redis SET NX is very fast (~100k ops/sec easily)
                 f"dedup:{event.event_id}", INSTANCE_ID, nx=True, ex=settings.dedup_ttl_seconds
             )
+            except Exception as redis_error:
+                logger.error(f"Redis error during deduplication check: {redis_error}")
+                # await websocket.send_text(f"Redis error: {redis_error}")
+                continue
+            if not claimed:
+                logger.info("Duplicate event detected, skipping processing", event_id=event.event_id, event_type=event.event_type)
+                continue
+                
+                
             if is_new:
                 #TODO: New event, proceed to persist on db 
                 #TODO: Transaction control to ensure event persistence
@@ -49,13 +67,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Processed new event", event_id=event.event_id, event_type=event.event_type)
             
             logger.info("Received event", event_id=event.event_id, event_type=event.event_type)
-        except ValidationError as e:
-            error_msg = f"Invalid event format received: {e.errors()}"
-            logger.error(error_msg)
-            await websocket.send_text(error_msg)
-        except Exception as e:
+    except ValidationError as e:
+        error_msg = f"Invalid event format received: {e.errors()}"
+        logger.error(error_msg)
+        await websocket.send_text(error_msg)
+    except Exception as e:
 
-                #TODO : handle this case
-            error_msg = f"An error occurred: {str(e)}"
-            logger.error(error_msg)
-            await websocket.send_text(error_msg)
+            #TODO : handle this case
+        error_msg = f"An error occurred: {str(e)}"
+        logger.error(error_msg)
+        await websocket.send_text(error_msg)

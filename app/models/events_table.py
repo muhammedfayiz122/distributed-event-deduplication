@@ -1,10 +1,8 @@
 from sqlalchemy import Column, String, Integer, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.declarative import declarative_base
+from app.models.base import BaseModel
 
-Base = declarative_base()
-
-class Event(Base):
+class Event(BaseModel):
     __tablename__ = 'events'
 
     id = Column(Integer, primary_key=True, index=True)
