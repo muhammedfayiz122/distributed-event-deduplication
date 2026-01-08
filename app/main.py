@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from app.config import settings
 from app.utils.logger import get_logger
@@ -20,10 +20,30 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+async def _release_lock_if_owner(dedup_key: str):
+    """
+    Safely release the dedup key from redis as some error occured while processing 
+    (only if key owned by this instance).
+    then other instance can pick it up again after TTL.
+    This prevents accidental deletion of another instance's claim.
+
+    Args:
+        dedup_key (str): _description_
+    """
+    try:
+        current_value = await redis_client.get(dedup_key)
+        if current_value == INSTANCE_ID:
+            await redis_client.delete(dedup_key)
+            logger.debug("Released dedup key (owner match).", dedup_key=dedup_key)
+        else:
+            logger.debug("Did not release dedup key (owner mismatch).", dedup_key=dedup_key, current_value=current_value)
+    except Exception as e:
+        logger.error(f"Error while releasing dedup key: {e}", dedup_key=dedup_key)
+    
 @app.websocket("/events")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("Client connected to /events (INSTANCE_ID=%s)", INSTANCE_ID)
+    logger.info("Client connected to /events", instance_id=INSTANCE_ID)
     
     try:
         while True:
@@ -41,9 +61,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             
             claimed = False
+            dedup_key = f"dedup:{event.event_id}"
             try:
                 claimed = await redis_client.set( # Redis SET NX is very fast (~100k ops/sec easily)
-                f"dedup:{event.event_id}", INSTANCE_ID, nx=True, ex=settings.dedup_ttl_seconds
+                dedup_key, INSTANCE_ID, nx=True, ex=settings.dedup_ttl_seconds
             )
             except Exception as redis_error:
                 logger.error(f"Redis error during deduplication check: {redis_error}")
@@ -53,27 +74,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.info("Duplicate event detected, skipping processing", event_id=event.event_id, event_type=event.event_type)
                 continue
                 
-                
-            if is_new:
-                #TODO: New event, proceed to persist on db 
+            # processing continues here for new events   
+            try:
+                #TODO: New event, proceed to persist on db
                 #TODO: Transaction control to ensure event persistence
-                #TODO: failure handling
+                pass
+            except Exception as db_error:
+                logger.error(f"Database error during event persistence: {db_error}")
+                await _release_lock_if_owner(dedup_key)
+                logger.exception("Processing failed", event_id=event.event_id, exc_info=db_error)
+                continue
                 #TODO: retry logic
-                try:
-                    await redis_client.delete(f"dedup:{event.event_id}")    
-                except Exception as delete_error:
-                    logger.error(f"Failed to delete dedup key: {delete_error}")
-                claimed = True
-                logger.info("Processed new event", event_id=event.event_id, event_type=event.event_type)
-            
-            logger.info("Received event", event_id=event.event_id, event_type=event.event_type)
-    except ValidationError as e:
-        error_msg = f"Invalid event format received: {e.errors()}"
-        logger.error(error_msg)
-        await websocket.send_text(error_msg)
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from /events", instance_id=INSTANCE_ID)
     except Exception as e:
-
-            #TODO : handle this case
-        error_msg = f"An error occurred: {str(e)}"
-        logger.error(error_msg)
-        await websocket.send_text(error_msg)
+        exception_msg = f"An error occurred: {str(e)}"
+        logger.exception(exception_msg)
+        # await websocket.send_text(exception_msg)
