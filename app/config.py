@@ -1,3 +1,4 @@
+from uuid import uuid4
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from functools import lru_cache
@@ -9,6 +10,7 @@ class Settings(BaseSettings):
     version: str = "0.1.0"
     debug: bool = True
     
+    instance_id: str = str(uuid4())
     dedup_ttl_seconds: int = 300  # Time-to-live for deduplication keys in seconds
     
     # Database settings

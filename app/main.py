@@ -1,4 +1,4 @@
-from sqlite3 import IntegrityError
+from sqlalchemy.exc import IntegrityError
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from app.config import settings
@@ -7,13 +7,12 @@ from app.schemas.event_schema import EventSchema
 from app.utils.redis_client import redis_client
 from app.database.sessions import get_db_session
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.events_table import Events
+from app.models.events_table import Events 
 from uuid import uuid4
 import json
 
 logger = get_logger(__name__)
-
-INSTANCE_ID = str(uuid4())
+INSTANCE_ID = settings.instance_id
 
 app = FastAPI(
     title=settings.app_name,
@@ -89,7 +88,7 @@ async def websocket_endpoint(websocket: WebSocket, db: AsyncSession =  Depends(g
             except ValidationError as ve:
                 error_msg = f"Invalid event format received: {ve.errors()}"
                 logger.error(error_msg)
-                await websocket.send_text(error_msg)
+                # await websocket.send_text(error_msg)
                 continue
             
             if not event.event_id:
