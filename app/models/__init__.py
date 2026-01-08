@@ -1,4 +1,4 @@
-from .events_table import Event
+from .events_table import Events
 from .base import Base
 
-__all__ = ["Event", "Base"]
+__all__ = ["Events", "Base"]

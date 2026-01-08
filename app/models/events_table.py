@@ -2,7 +2,7 @@ from sqlalchemy import Column, String, Integer, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
 from app.models.base import BaseModel
 
-class Event(BaseModel):
+class Events(BaseModel):
     __tablename__ = 'events'
 
     id = Column(Integer, primary_key=True, index=True)
