@@ -1,10 +1,13 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from sqlite3 import IntegrityError
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from app.config import settings
 from app.utils.logger import get_logger
 from app.schemas.event_schema import EventSchema
 from app.utils.redis_client import redis_client
 from app.database.sessions import get_db_session
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.events_table import Events
 from uuid import uuid4
 import json
 
@@ -40,8 +43,41 @@ async def _release_lock_if_owner(dedup_key: str):
     except Exception as e:
         logger.error(f"Error while releasing dedup key: {e}", dedup_key=dedup_key)
     
+async def process_persist(event: Events, db: AsyncSession):
+    """
+    Process and persist the event to the database.
+    Args:
+        event (EventSchema): The event data to persist.
+        db (AsyncSession): The database session.
+        
+    IMPORTANT: all external side-effects must be idempotent and use event.event_id as idempotency key.
+    Example external calls are :
+    -> EXTERNAL SIDE-EFFECT (example): call payment/email APIs with idempotency key
+    -> payment_gateway.charge(amount, idempotency_key=event.event_id)
+    -> email_sender.send(template, idempotency_key=event.event_id)
+    -> All of the above must be idempotent by using event.event_id.
+    """
+
+    db_item = Events(
+        event_id=event.event_id,
+        event_type=event.event_type,
+        payload=event.payload
+    )
+    db.add(db_item)
+    
+    try:
+        await db.commit()
+        logger.info("Event persisted successfully.", event_id=event.event_id)
+    except IntegrityError as e:
+        await db.rollback()
+        logger.warning("Integrity error while persisting event (possible duplicate).", event_id=event.event_id, error=str(e))
+    except Exception as e:
+        await db.rollback()
+        logger.error("Error while persisting event.", event_id=event.event_id, error=str(e))
+        raise
+
 @app.websocket("/events")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, db: AsyncSession =  Depends(get_db_session)):
     await websocket.accept()
     logger.info("Client connected to /events", instance_id=INSTANCE_ID)
     
@@ -76,9 +112,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 
             # processing continues here for new events   
             try:
-                #TODO: New event, proceed to persist on db
-                #TODO: Transaction control to ensure event persistence
-                pass
+                await process_persist(event, db)
             except Exception as db_error:
                 logger.error(f"Database error during event persistence: {db_error}")
                 await _release_lock_if_owner(dedup_key)

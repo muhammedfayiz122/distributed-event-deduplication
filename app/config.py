@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # Database settings
     database_url: str = Field(default="postgresql+asyncpg://postgres:123@localhost:5432/shipment_tracker_02")
     
+    # Redis settings
+    REDIS_HOST: str = Field(default="localhost")
+    REDIS_PORT: int = Field(default=6379)
     class Config:
         env_file = ".env"
         case_sensitive = False
