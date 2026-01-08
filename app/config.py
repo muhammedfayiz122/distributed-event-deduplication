@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from functools import lru_cache
 
 class Settings(BaseSettings):
@@ -11,7 +12,13 @@ class Settings(BaseSettings):
     dedup_ttl_seconds: int = 300  # Time-to-live for deduplication keys in seconds
     
     # Database settings
-    database_url: str = "postgresql+asyncpg://postgres:123@localhost:5432/shipment_tracker_02"
+    database_url: str = Field(default="postgresql+asyncpg://postgres:123@localhost:5432/shipment_tracker_02")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+        env_file_encoding = "utf-8"
+        extra = "allow"
     
 @lru_cache()
 def get_settings() -> Settings:
